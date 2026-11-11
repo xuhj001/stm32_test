@@ -1,0 +1,53 @@
+# 多STM32工程仓库 .gitignore
+# 仓库根：stm32-test/，里面放多个工程文件夹 test、demo1、demo2...
+
+# CubeMX本地缓存（所有子工程里的 .mxproject 全部忽略）
+**/.mxproject
+**/*.ioc.backup
+**/.cube
+
+# MDK编译输出目录，任意子文件夹下的这几个目录都忽略
+**/Listings/
+**/Objects/
+**/Output/
+**/DebugConfig/
+
+# MDK编译中间文件、固件
+**/*.o
+**/*.obj
+**/*.d
+**/*.crf
+**/*.dep
+**/*.lst
+**/*.map
+**/*.axf
+**/*.elf
+**/*.hex
+**/*.bin
+**/*.srec
+**/*.plg
+**/*.trf
+**/*.build_log.htm
+
+# Keil本地布局文件（重点，所有子工程都过滤）
+**/*.uvgui*
+**/*.uvopt*
+# 保留 *.uvprojx 工程文件
+
+# 备份、临时文件
+**/*.bak
+**/*.tmp
+**/*.$$$
+
+# JLink调试文件
+**/*.ini
+**/JLinkLog.txt
+**/JLinkSettings.ini
+
+# 系统垃圾
+Thumbs.db
+.DS_Store
+
+# vscode 本地配置（可选）
+.vscode/
+.idea/
