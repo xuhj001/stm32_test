@@ -78,7 +78,7 @@ void ledControl(uint8_t device, uint8_t cmd) {
 	}
 }
 
-void ledTest() {
+void ledTest(void) {
 	ledControl(LED1, ON);
 	ledControl(LED2, OFF);
 	HAL_Delay(500);

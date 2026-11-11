@@ -40,7 +40,7 @@ extern "C" {
 #define OFF  0
 
 void ledControl(uint8_t device, uint8_t cmd);
-void ledTest();
+void ledTest(void);
 
 /* USER CODE END Private defines */
 
