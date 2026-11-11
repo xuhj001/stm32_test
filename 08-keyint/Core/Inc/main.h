@@ -61,8 +61,9 @@ void Error_Handler(void);
 #define BEEP_GPIO_Port GPIOC
 #define RELAY_Pin GPIO_PIN_1
 #define RELAY_GPIO_Port GPIOB
-#define OK_Pin GPIO_PIN_12
-#define OK_GPIO_Port GPIOB
+#define KEY_OK_Pin GPIO_PIN_12
+#define KEY_OK_GPIO_Port GPIOB
+#define KEY_OK_EXTI_IRQn EXTI15_10_IRQn
 #define KEY_UP_Pin GPIO_PIN_13
 #define KEY_UP_GPIO_Port GPIOB
 #define KEY_UP_EXTI_IRQn EXTI15_10_IRQn
@@ -71,10 +72,13 @@ void Error_Handler(void);
 #define KEY_DOWN_EXTI_IRQn EXTI15_10_IRQn
 #define KEY_RIGHT_Pin GPIO_PIN_15
 #define KEY_RIGHT_GPIO_Port GPIOB
+#define KEY_RIGHT_EXTI_IRQn EXTI15_10_IRQn
 #define KEY_ESC_Pin GPIO_PIN_8
 #define KEY_ESC_GPIO_Port GPIOA
+#define KEY_ESC_EXTI_IRQn EXTI9_5_IRQn
 #define KEY_LEFT_Pin GPIO_PIN_5
 #define KEY_LEFT_GPIO_Port GPIOB
+#define KEY_LEFT_EXTI_IRQn EXTI9_5_IRQn
 #define LED2_Pin GPIO_PIN_8
 #define LED2_GPIO_Port GPIOB
 #define LED1_Pin GPIO_PIN_9

@@ -74,25 +74,24 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : OK_Pin KEY_RIGHT_Pin KEY_LEFT_Pin */
-  GPIO_InitStruct.Pin = OK_Pin|KEY_RIGHT_Pin|KEY_LEFT_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : KEY_UP_Pin KEY_DOWN_Pin */
-  GPIO_InitStruct.Pin = KEY_UP_Pin|KEY_DOWN_Pin;
+  /*Configure GPIO pins : KEY_OK_Pin KEY_UP_Pin KEY_DOWN_Pin KEY_RIGHT_Pin
+                           KEY_LEFT_Pin */
+  GPIO_InitStruct.Pin = KEY_OK_Pin|KEY_UP_Pin|KEY_DOWN_Pin|KEY_RIGHT_Pin
+                          |KEY_LEFT_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /*Configure GPIO pin : KEY_ESC_Pin */
   GPIO_InitStruct.Pin = KEY_ESC_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(KEY_ESC_GPIO_Port, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+
   HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
@@ -143,7 +142,7 @@ uint8_t keyScan(void) {
     SCAN_KEY(KEY_DOWN_GPIO_Port, KEY_DOWN_Pin, KEY_DOWN);
     SCAN_KEY(KEY_LEFT_GPIO_Port, KEY_LEFT_Pin, KEY_LEFT);
     SCAN_KEY(KEY_RIGHT_GPIO_Port, KEY_RIGHT_Pin, KEY_RIGHT);
-    SCAN_KEY(OK_GPIO_Port, OK_Pin, KEY_OK);
+    SCAN_KEY(KEY_OK_GPIO_Port, KEY_OK_Pin, KEY_OK);
     SCAN_KEY(KEY_ESC_GPIO_Port, KEY_ESC_Pin, KEY_ESC);
     return 0;
 }

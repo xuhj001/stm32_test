@@ -200,6 +200,21 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /**
+  * @brief This function handles EXTI line[9:5] interrupts.
+  */
+void EXTI9_5_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI9_5_IRQn 0 */
+
+  /* USER CODE END EXTI9_5_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(KEY_LEFT_Pin);
+  HAL_GPIO_EXTI_IRQHandler(KEY_ESC_Pin);
+  /* USER CODE BEGIN EXTI9_5_IRQn 1 */
+
+  /* USER CODE END EXTI9_5_IRQn 1 */
+}
+
+/**
   * @brief This function handles EXTI line[15:10] interrupts.
   */
 void EXTI15_10_IRQHandler(void)
@@ -207,8 +222,10 @@ void EXTI15_10_IRQHandler(void)
   /* USER CODE BEGIN EXTI15_10_IRQn 0 */
 
   /* USER CODE END EXTI15_10_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(KEY_OK_Pin);
   HAL_GPIO_EXTI_IRQHandler(KEY_UP_Pin);
   HAL_GPIO_EXTI_IRQHandler(KEY_DOWN_Pin);
+  HAL_GPIO_EXTI_IRQHandler(KEY_RIGHT_Pin);
   /* USER CODE BEGIN EXTI15_10_IRQn 1 */
 
   /* USER CODE END EXTI15_10_IRQn 1 */
@@ -220,6 +237,14 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 		ledControl(LED1, ON);
 	}else if(GPIO_Pin == KEY_DOWN_Pin) {
 		ledControl(LED1, OFF);
+	}else if(GPIO_Pin == KEY_LEFT_Pin) {
+		ledControl(LED2, ON);
+	}else if(GPIO_Pin == KEY_RIGHT_Pin) {
+		ledControl(LED2, OFF);
+	} else if(GPIO_Pin == KEY_OK_Pin) {
+		beepControl(ON);
+	}else if(GPIO_Pin == KEY_ESC_Pin) {
+		beepControl(OFF);
 	}
 }
 
