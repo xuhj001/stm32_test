@@ -161,7 +161,7 @@ void OLED_ShowStr(unsigned char x, unsigned char y, unsigned char ch[], unsigned
 	I2C1_Lock();
 	switch(TextSize)
 	{
-		case 2:
+		case OLED_FONT_8X16:
 		{
 			while(ch[j] != '\0')
 			{

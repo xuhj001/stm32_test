@@ -21,7 +21,7 @@ static uint8_t  aht20BusyCnt = 0;    // 读到忙状态的次数
 uint8_t AHT20_Read_Status(void)
 {	
 	uint8_t tmp[1];
-	HAL_I2C_Master_Receive(&hi2c1,ATH20_SLAVE_ADDRESS,tmp,1,0xFFFF);	
+	HAL_I2C_Master_Receive(&hi2c1, ATH20_SLAVE_ADDRESS, tmp, 1, 1000);
 	return tmp[0];
 }
 
@@ -32,7 +32,7 @@ static void AHT20_TrigMeasureCmd(void)
 	tmp[0] = 0xac; // AHT20_TrigMeasure_REG	0xAC	//触发测量 寄存器地址
 	tmp[1] = 0x33;
 	tmp[2] = 0x00;
-	HAL_I2C_Master_Transmit(&hi2c1, ATH20_SLAVE_ADDRESS,tmp,3,0xFFFF);
+	HAL_I2C_Master_Transmit(&hi2c1, ATH20_SLAVE_ADDRESS, tmp, 3, 1000);
 }
 
 
@@ -43,7 +43,7 @@ void AHT20_DeInit(void)
 	tmp[0] = 0xbe; //AHT20_INIT_REG				0xBE	//初始化 寄存器地址
 	tmp[1] = 0x08;
 	tmp[2] = 0x00;
-	HAL_I2C_Master_Transmit(&hi2c1, ATH20_SLAVE_ADDRESS,tmp,3,0xFFFF);
+	HAL_I2C_Master_Transmit(&hi2c1, ATH20_SLAVE_ADDRESS, tmp, 3, 1000);
 }
 
 //初始化AHT20（只在上电时调用一次，允许使用阻塞延时）
@@ -55,7 +55,7 @@ void AHT20_Init(void)
 	tmp[0] = 0xbe; //AHT20_INIT_REG				0xBE	//初始化 寄存器地址
 	tmp[1] = 0x08;
 	tmp[2] = 0x00;
-	HAL_I2C_Master_Transmit(&hi2c1, ATH20_SLAVE_ADDRESS,tmp,3,0xFFFF);
+	HAL_I2C_Master_Transmit(&hi2c1, ATH20_SLAVE_ADDRESS, tmp, 3, 1000);
 	
 	if(!((AHT20_Read_Status()&0x08)==0x08))
 	{
@@ -95,7 +95,7 @@ void AHT20_Poll(void)
 		return;
 	}
 
-	HAL_I2C_Master_Receive(&hi2c1, ATH20_SLAVE_ADDRESS, tmp, 6, 0xFFFF);
+	HAL_I2C_Master_Receive(&hi2c1, ATH20_SLAVE_ADDRESS, tmp, 6, 1000);
 	aht20Busy = 0;
 
 	// 相对湿度 RH：原始值 20 位，等同于 (tmp[1]<<16 | tmp[2]<<8 | tmp[3]) >> 4

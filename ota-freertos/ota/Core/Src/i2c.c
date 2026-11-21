@@ -29,7 +29,6 @@
 
 // I2C1 上挂了 OLED、AHT20、INA226，分属不同任务，访问总线前必须先拿这把锁
 static SemaphoreHandle_t i2c1Mutex = NULL;
-static StaticSemaphore_t i2c1MutexBuf;
 /* USER CODE END 0 */
 
 I2C_HandleTypeDef hi2c1;
@@ -118,9 +117,12 @@ void HAL_I2C_MspDeInit(I2C_HandleTypeDef* i2cHandle)
 }
 
 /* USER CODE BEGIN 1 */
-// 在 MX_FREERTOS_Init 中、调度器启动前调用
+// 在 MX_FREERTOS_Init 中、调度器启动前调用（从 FreeRTOS 堆动态创建）
 void I2C1_LockInit(void) {
-	i2c1Mutex = xSemaphoreCreateMutexStatic(&i2c1MutexBuf);
+	i2c1Mutex = xSemaphoreCreateMutex();
+	if (i2c1Mutex == NULL) {
+		Error_Handler();
+	}
 }
 
 // 调度器启动前（main 里的初始化阶段）只有一个执行流，不需要加锁

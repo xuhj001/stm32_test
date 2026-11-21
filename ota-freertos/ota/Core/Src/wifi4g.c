@@ -230,15 +230,24 @@ uint8_t wifiCheckCmdStatus(const char *atCmd, uint32_t Timeout) {
 	printf("[AT] >> %s", atCmd);   // atCmd 自带 \r\n
 	HAL_UART_Transmit(&huart3, (uint8_t *)atCmd, strlen(atCmd), 1000);
 	start = xTaskGetTickCount();
-	for (;;) {
-		wifiPoll();   // 边等边收包解析（连接阶段模组原始应答会打印到串口 1）
-		if (gWifi4G.cmdStatus != WIFI4G_NOT) {
-			break;
+	{
+		TickType_t lastBeat = start;
+		for (;;) {
+			wifiPoll();
+			if (gWifi4G.cmdStatus != WIFI4G_NOT) {
+				break;
+			}
+			if ((xTaskGetTickCount() - start) >= pdMS_TO_TICKS(Timeout)) {
+				break;
+			}
+			/* 长等待（如 AT+REST 180s）每 5s 打一拍，避免串口“假死” */
+			if ((xTaskGetTickCount() - lastBeat) >= pdMS_TO_TICKS(5000)) {
+				lastBeat = xTaskGetTickCount();
+				printf("[AT] .. waiting %lu ms\r\n",
+					(unsigned long)(HAL_GetTick() - t0));
+			}
+			wifiWaitRx(WIFI_POLL_MS);
 		}
-		if ((xTaskGetTickCount() - start) >= pdMS_TO_TICKS(Timeout)) {
-			break;
-		}
-		wifiWaitRx(WIFI_POLL_MS);
 	}
 	if (gWifi4G.cmdStatus == WIFI4G_OK) {
 		result = "OK";
@@ -275,10 +284,7 @@ void wifiPoll(void) {
 	uint32_t n = wifiFetch();
 
 	if (n > 0) {
-		if (!gWifi4G.connected) {
-			// 连接阶段（AT 命令应答）：把模组原始数据打印到串口 1，便于看返回内容
-			HAL_UART_Transmit(&huart1, wifiData + wifiLen, (uint16_t)n, 1000);
-		}
+		// 连接阶段不再把模组原始数据整段转发到 USART1（会长时间阻塞 Comm）
 		wifiLen += n;
 		wifiData[wifiLen] = 0;
 		wifiLastRx = HAL_GetTick();

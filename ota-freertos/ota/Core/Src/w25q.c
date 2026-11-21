@@ -1,8 +1,11 @@
 #include "w25q.h"
+#include "FreeRTOS.h"
+#include "task.h"
 
 /*
  * 寄存器级 SPI1 主机，模式0（CPOL=0, CPHA=0），8位，MSB 在前。
  * APB2 = 72MHz，BR=/8 => 9MHz，W25Q 的 READ(0x03) 指令最高支持 50MHz。
+ * waitReady 用 vTaskDelay 让出 CPU（须在调度器启动后调用；Boot 侧副本仍为忙等）。
  */
 
 #define CMD_WRITE_ENABLE    0x06
@@ -62,12 +65,12 @@ static void writeEnable(void) {
 	csHigh();
 }
 
-// 等待芯片空闲（状态寄存器 BUSY 位清零）
+// 等待芯片空闲（状态寄存器 BUSY 位清零）；忙时 vTaskDelay(1) 让出 CPU
 static uint8_t waitReady(uint32_t timeoutMs) {
-	uint32_t start = HAL_GetTick();
+	TickType_t start = xTaskGetTickCount();
 	uint8_t status;
 
-	do {
+	for (;;) {
 		CS_LOW();
 		spiXfer(CMD_READ_STATUS1);
 		status = spiXfer(0xFF);
@@ -75,8 +78,11 @@ static uint8_t waitReady(uint32_t timeoutMs) {
 		if (!(status & STATUS_BUSY)) {
 			return W25Q_OK;
 		}
-	} while ((HAL_GetTick() - start) <= timeoutMs);
-	return W25Q_ERR;
+		if ((xTaskGetTickCount() - start) > pdMS_TO_TICKS(timeoutMs)) {
+			return W25Q_ERR;
+		}
+		vTaskDelay(pdMS_TO_TICKS(1));
+	}
 }
 
 uint8_t W25Q_Init(void) {

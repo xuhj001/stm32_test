@@ -22,6 +22,7 @@
 #include "adc.h"
 #include "dma.h"
 #include "i2c.h"
+#include "iwdg.h"
 #include "spi.h"
 #include "usart.h"
 #include "gpio.h"
@@ -109,12 +110,17 @@ int main(void)
   MX_I2C1_Init();
   MX_ADC1_Init();
   MX_SPI1_Init();
+  MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
-	printf("> OTA1.1 connect mqtt...\n");  
+	if (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST) != RESET) {
+		printf("> reset by IWDG\r\n");
+	}
+	__HAL_RCC_CLEAR_RESET_FLAGS();
+	printf("> OTA 1.1 connect mqtt...\n");
 	OLED_Init();
 	OLED_CLS(); // 清除屏幕显示
-	OLED_ShowStr(0,0, (unsigned char*)" OTA 1.1", 2);	
-	OLED_ShowStr(0,3,  (unsigned char*)"MQTTSvr...", 2);	
+	OLED_ShowStr(0, 0, (unsigned char *)" OTA 1.1", OLED_FONT_8X16);
+	OLED_ShowStr(0, 3, (unsigned char *)"MqttServer...", OLED_FONT_8X16);
 	AHT20_Init();
 	INA226_Init();
 	printf("> W25Q32 %s\n", W25Q_Init() ? "OK" : "NOT FOUND");   // 初始化外部 Flash（OTA 暂存区）
@@ -158,10 +164,11 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI|RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;

@@ -17,7 +17,12 @@
 #define OTA_POLL_MS            10      // 等待分包时，没有新数据最多等这么久也解析一次
 
 __IO uint8_t gOtaFlag = 0; //  请求服务器发送分包固件标识位
-OTA_FW_Info_T OTA_Info ; // 描述OTA固件信息的结构体
+__IO uint8_t gOtaBusy = 0; // OTA 下载进行中
+OTA_FW_Info_T OTA_Info ; // OTA 专用状态（不含 RPC/属性 JSON）
+
+// 下行 JSON 临时缓冲：RPC 与 attributes 共用，与 OTA_Info.chunk_buf 隔离
+static uint8_t mqttJsonBuf[NSize];
+static uint32_t sOtaLastPercent = 0xFFFFFFFFU;
 
 #define WIFI4G_SEND_CHECK(cmd)                                  \
 	do {                                                          \
@@ -45,9 +50,9 @@ static uint8_t mqttIsHex(const char *s) {
 }
 
 // 在 recvbuf 中查找 key：
-//   dataNum 不为空时，取出 key 后面的数字；
-//   然后取出 key 之后第一个完整的 {...} JSON（按括号配对，支持嵌套），拷贝到 OTA_Info.recv_buf
-uint8_t mqttValue(char *recvbuf, char *key, uint32_t *dataNum) {
+//   outId 不为空时，取出 key 后面的数字（如 RPC 请求号）；
+//   然后取出 key 之后第一个完整的 {...} JSON（按括号配对，支持嵌套），拷贝到 mqttJsonBuf
+uint8_t mqttValue(char *recvbuf, char *key, uint32_t *outId) {
 	char *startp = NULL;
 	char *leftp = NULL;
 	char *p = NULL;
@@ -58,8 +63,8 @@ uint8_t mqttValue(char *recvbuf, char *key, uint32_t *dataNum) {
 	if (startp == NULL) {
 		return RESET;
 	}
-	if (dataNum != NULL) {
-		*dataNum = strtol(startp + strlen(key), NULL, 10);
+	if (outId != NULL) {
+		*outId = strtol(startp + strlen(key), NULL, 10);
 	}
 
 	leftp = strchr(startp, '{');
@@ -83,36 +88,36 @@ uint8_t mqttValue(char *recvbuf, char *key, uint32_t *dataNum) {
 	}
 
 	jsonLen = (uint32_t)(p - leftp + 1);
-	if (jsonLen >= sizeof(OTA_Info.recv_buf)) {
+	if (jsonLen >= sizeof(mqttJsonBuf)) {
 		return RESET;
 	}
-	memset(OTA_Info.recv_buf, 0, sizeof(OTA_Info.recv_buf));
-	memcpy(OTA_Info.recv_buf, leftp, jsonLen);
+	memset(mqttJsonBuf, 0, sizeof(mqttJsonBuf));
+	memcpy(mqttJsonBuf, leftp, jsonLen);
 	return SET;
 }
 
 // len 为本次实际收到的字节数（用于校验二进制分包是否完整）
 uint8_t mqttParse(uint8_t *recvbuf, uint32_t len) {
-	uint32_t dataNum = 0;
+	uint32_t rpcId = 0;
 	char tmp[64] = {0};
 	char *startp = NULL;
 	uint32_t used = 0;
 
 	// 解控制命令
-	if (mqttValue((char *)recvbuf, "v1/devices/me/rpc/request/", &dataNum) == SET) {
-		printf("[DOWN] rpc id=%d %s\r\n", (int)dataNum, (char *)OTA_Info.recv_buf);
-		mqttParseDevice((uint8_t *)OTA_Info.recv_buf, dataNum);
+	if (mqttValue((char *)recvbuf, "v1/devices/me/rpc/request/", &rpcId) == SET) {
+		printf("[DOWN] rpc id=%d %s\r\n", (int)rpcId, (char *)mqttJsonBuf);
+		mqttParseDevice(mqttJsonBuf, rpcId);
 		return SET;
 	}
 
 	// 解 OTA 信息（属性）
 	if (mqttValue((char *)recvbuf, "v1/devices/me/attributes", NULL) == SET) {
-		printf("[DOWN] attributes %s\r\n", (char *)OTA_Info.recv_buf);
-		mqttParseOtaData(OTA_Info.recv_buf);
+		printf("[DOWN] attributes %s\r\n", (char *)mqttJsonBuf);
+		mqttParseOtaData(mqttJsonBuf);
 		return SET;
 	}
 
-	// 解 OTA 分包数据
+	// 解 OTA 分包数据（写入 OTA_Info.chunk_buf，与 mqttJsonBuf 隔离）
 	sprintf(tmp, "v2/fw/response/%d/chunk/%d,%d,",
 		OTA_Info.request_id, OTA_Info.chunk_id, OTA_Info.request_bytes);
 	startp = strstr((char *)recvbuf, tmp);
@@ -122,26 +127,32 @@ uint8_t mqttParse(uint8_t *recvbuf, uint32_t len) {
 		if (used + OTA_Info.request_bytes > len) {
 			return RESET;
 		}
-		memset(OTA_Info.recv_buf, 0, sizeof(OTA_Info.recv_buf));
-		memcpy(OTA_Info.recv_buf, startp + strlen(tmp), OTA_Info.request_bytes);
-		OTA_Info.recv_flag = 1; // OTA 收到固件内容
+		if (OTA_Info.request_bytes > sizeof(OTA_Info.chunk_buf)) {
+			return RESET;
+		}
+		// OtaTask 尚未取走上一包时不覆盖，避免 Comm 抢占写入时破坏正在校验/写 Flash 的数据
+		if (OTA_Info.recv_flag != 0) {
+			return SET;
+		}
+		memcpy(OTA_Info.chunk_buf, startp + strlen(tmp), OTA_Info.request_bytes);
+		OTA_Info.recv_flag = 1; // OTA 收到固件内容（OtaTask 等待此标志）
 		return SET;
 	}
 
 	return RESET;
 }
 
-void mqttContrl(uint8_t value, uint32_t dataNum, uint16_t cmd) {
+void mqttContrl(uint8_t value, uint32_t rpcId, uint16_t cmd) {
 	if (value == 1) {
 		REG_HOLD_BUF[0] |= cmd;
-		mqttSendData((uint8_t *)PUB2, dataNum, value);
+		mqttSendData((uint8_t *)PUB2, rpcId, value);
 	} else if (value == 0) {
 		REG_HOLD_BUF[0] = REG_HOLD_BUF[0] & (~cmd);
-		mqttSendData((uint8_t *)PUB2, dataNum, value);
+		mqttSendData((uint8_t *)PUB2, rpcId, value);
 	}
 }
 
-uint8_t mqttParseDevice(uint8_t *json, uint32_t dataNum) {
+uint8_t mqttParseDevice(uint8_t *json, uint32_t rpcId) {
 	cJSON *cjson_device = NULL;
 	cJSON *cjson_method = NULL;
 	cJSON *cjson_params = NULL;
@@ -165,20 +176,20 @@ uint8_t mqttParseDevice(uint8_t *json, uint32_t dataNum) {
 
 	// 获取状态
 	if (strcmp(method, "led1Status") == 0) {
-		mqttSendData((uint8_t *)PUB2, dataNum, HAL_GPIO_ReadPin(LED1_GPIO_Port, LED1_Pin) == GPIO_PIN_RESET);
+		mqttSendData((uint8_t *)PUB2, rpcId, HAL_GPIO_ReadPin(LED1_GPIO_Port, LED1_Pin) == GPIO_PIN_RESET);
 	} else if (strcmp(method, "beepStatus") == 0) {
-		mqttSendData((uint8_t *)PUB2, dataNum, HAL_GPIO_ReadPin(BEEP_GPIO_Port, BEEP_Pin) == GPIO_PIN_SET);
+		mqttSendData((uint8_t *)PUB2, rpcId, HAL_GPIO_ReadPin(BEEP_GPIO_Port, BEEP_Pin) == GPIO_PIN_SET);
 	} else if (strcmp(method, "relayStatus") == 0) {
-		mqttSendData((uint8_t *)PUB2, dataNum, HAL_GPIO_ReadPin(RELAY_GPIO_Port, RELAY_Pin) == GPIO_PIN_SET);
+		mqttSendData((uint8_t *)PUB2, rpcId, HAL_GPIO_ReadPin(RELAY_GPIO_Port, RELAY_Pin) == GPIO_PIN_SET);
 	}
 
 	// 控制
 	if (strcmp(method, "led1Set") == 0) {
-		mqttContrl(value, dataNum, LED1_CMD);
+		mqttContrl(value, rpcId, LED1_CMD);
 	} else if (strcmp(method, "beepSet") == 0) {
-		mqttContrl(value, dataNum, BEEP_CMD);
+		mqttContrl(value, rpcId, BEEP_CMD);
 	} else if (strcmp(method, "relaySet") == 0) {
-		mqttContrl(value, dataNum, RELAY_CMD);
+		mqttContrl(value, rpcId, RELAY_CMD);
 	}
 
 	// 一定要释放内存
@@ -186,27 +197,28 @@ uint8_t mqttParseDevice(uint8_t *json, uint32_t dataNum) {
 	return SET;
 }
 
-uint8_t mqttSendData(uint8_t *topic, uint32_t dataNum, uint8_t status) {
+// id：PUB1 时为上报类型（MQTT_MSG_*）；PUB2 时为 RPC 请求号
+uint8_t mqttSendData(uint8_t *topic, uint32_t id, uint8_t status) {
 	uint8_t sendbuf[128] = {0};
 	uint8_t buf[256] = {0};
 	char *statusStr = status > 0 ? "true" : "false";
 
 	if (strncmp((char *)topic, PUB1, strlen(PUB1) - 1) == 0) {
-		if (dataNum == 1) { // 上传传感器数据
+		if (id == MQTT_MSG_TELEMETRY) {
 			sprintf((char *)sendbuf, "{TP:%d,RH:%d,VO:%d,CU:%d,PW:%d,VR:%d,CPU:%d}",
 				REG_HOLD_BUF[1], REG_HOLD_BUF[2], REG_HOLD_BUF[3], REG_HOLD_BUF[4],
 				REG_HOLD_BUF[5], REG_HOLD_BUF[6], REG_HOLD_BUF[7]);
 			sprintf((char *)buf, "MQPUB,1,%s,%s", PUB1, sendbuf);
-		} else if (dataNum == 2) { // ota 状态更新：成功
+		} else if (id == MQTT_MSG_OTA_OK) {
 			sprintf((char *)sendbuf, "{\"fw_state\":\"UPDATED\"}");
 			sprintf((char *)buf, "MQPUB,1,%s,%s", PUB1, sendbuf);
-		} else if (dataNum == 3) { // ota 状态更新：最终失败
+		} else if (id == MQTT_MSG_OTA_FAIL) {
 			sprintf((char *)sendbuf, "{\"fw_state\":\"FAILED\"}");
 			sprintf((char *)buf, "MQPUB,1,%s,%s", PUB1, sendbuf);
 		}
 	} else if (strncmp((char *)topic, PUB2, strlen(PUB2) - 1) == 0) {
 		// 回复服务器下发的命令 PUB2  "v1/devices/me/rpc/response/"
-		sprintf((char *)buf, "MQPUB,1,%s%d,%s", PUB2, dataNum, statusStr);
+		sprintf((char *)buf, "MQPUB,1,%s%d,%s", PUB2, id, statusStr);
 	}
 
 	if (buf[0] != '\0') {
@@ -273,34 +285,46 @@ uint8_t mqttParseOtaData(uint8_t *json) {
 	return SET;
 }
 
-// 每收到数据包时调用，len 为本包实际字节数
+// 每收到数据包时调用，len 为本包实际字节数；百分比未变则不刷 OLED，少占 I2C
 void Update_Progress(uint32_t len) {
 	uint32_t percent = 0;
-	char progress[24] = {0}; // 显示"OTA" + 版本(最多8字符) + 进度，最长约21字符
+	char progress[24] = {0};
 
 	OTA_Info.received_bytes += len;
+	if (OTA_Info.fw_size == 0) {
+		return;
+	}
 	percent = (OTA_Info.received_bytes * 100) / OTA_Info.fw_size;
 	if (percent > 100) {
 		percent = 100;
 	}
+	if (percent == sOtaLastPercent) {
+		return;
+	}
+	sOtaLastPercent = percent;
 	if (percent == 100) {
 		sprintf(progress, "OTA%.8s        OK", OTA_Info.fw_version);
 	} else {
 		sprintf(progress, "OTA%.8s      %3d%%", OTA_Info.fw_version, (int)percent);
 	}
-	OLED_ShowStr(0, 6, (uint8_t *)progress, 2); // 第2行显示（如" 75%")
+	printf("[OTA] progress %u%% (%u/%u)\r\n",
+		(unsigned int)percent,
+		(unsigned int)OTA_Info.received_bytes,
+		(unsigned int)OTA_Info.fw_size);
+	OLED_ShowStr(0, 6, (uint8_t *)progress, OLED_FONT_8X16);
 }
 
 // 本次升级失败：还有重试次数就重新下载，否则放弃并上报 FAILED
 static void mqttOtaFail(void) {
+	gOtaBusy = 0;   // 允许 CommTask 恢复遥测/重连
 	OTA_Info.ota_try++;
 	if (OTA_Info.ota_try < OTA_MAX_TRY) {
 		printf("[OTA] try %u/%u failed, retry\r\n", (unsigned int)OTA_Info.ota_try, (unsigned int)OTA_MAX_TRY);
-		gOtaFlag = 1;   // 通信任务会再次调用 MQTT_OTA_GetFW
+		gOtaFlag = 1;   // CommTask 延时后再次通知 OtaTask
 	} else {
 		printf("[OTA] try %u/%u failed, give up, report FAILED\r\n", (unsigned int)OTA_Info.ota_try, (unsigned int)OTA_MAX_TRY);
-		mqttSendData((uint8_t *)PUB1, 3, 0); // 3 表示最终失败
-		OLED_ShowStr(64 + 16, 6, (uint8_t *)"  Fail", 2);
+		mqttSendData((uint8_t *)PUB1, MQTT_MSG_OTA_FAIL, 0);
+		OLED_ShowStr(64 + 16, 6, (uint8_t *)"  Fail", OLED_FONT_8X16);
 	}
 }
 
@@ -327,6 +351,7 @@ uint8_t MQTT_OTA_GetFW(void) {
 		return RESET;
 	}
 
+	gOtaBusy = 1;   // CommTask 继续收包，但暂停遥测/重连，避免与分包请求抢 TX
 	printf("[OTA] start try %u/%u, version=%s size=%u checksum=%s\r\n",
 		(unsigned int)(OTA_Info.ota_try + 1), (unsigned int)OTA_MAX_TRY,
 		OTA_Info.fw_version, (unsigned int)OTA_Info.fw_size, OTA_Info.fw_checksum);
@@ -337,7 +362,6 @@ uint8_t MQTT_OTA_GetFW(void) {
 		return RESET;
 	}
 	for (addr = 0; addr < OTA_Info.fw_size; addr += W25Q_SECTOR_SIZE) {
-		wifiPoll(); // 擦除较慢，期间处理一下串口收到的数据
 		if (W25Q_EraseSector(OTA_DATA_ADDR + addr) != W25Q_OK) {
 			mqttOtaFail();
 			return RESET;
@@ -346,6 +370,7 @@ uint8_t MQTT_OTA_GetFW(void) {
 
 	CRC32_Init(&crc_ctx); // 重置CRC
 	OTA_Info.received_bytes = 0;
+	sOtaLastPercent = 0xFFFFFFFFU;
 	OTA_Info.request_id = HAL_GetTick() + (rand() & 0xFFFF);
 	OTA_Info.chunk_id = 0;
 	OTA_Info.request_bytes = 256; // 默认请求数据为256字节
@@ -354,7 +379,6 @@ uint8_t MQTT_OTA_GetFW(void) {
 		char strNumber[10] = {0};
 		uint8_t got = 0;
 		uint8_t tryNo = 0;
-		CRC32_Context chunkCtx;   // 本包单独的 CRC（调试用，用来和本地 bin 逐包比对）
 
 		if ((i == size - 1) && (OTA_Info.fw_size % 256 != 0)) { // 最后1包数据
 			OTA_Info.request_bytes = OTA_Info.fw_size % 256;
@@ -370,8 +394,7 @@ uint8_t MQTT_OTA_GetFW(void) {
 			start = xTaskGetTickCount();
 			while (OTA_Info.recv_flag == 0 &&
 				(xTaskGetTickCount() - start) < pdMS_TO_TICKS(OTA_CHUNK_TIMEOUT_MS)) {
-				wifiWaitRx(OTA_POLL_MS); // 等串口数据，不占 CPU
-				wifiPoll();              // 边等边收包解析
+				vTaskDelay(pdMS_TO_TICKS(OTA_POLL_MS));
 			}
 			got = OTA_Info.recv_flag;
 			if (!got) {
@@ -383,26 +406,29 @@ uint8_t MQTT_OTA_GetFW(void) {
 			mqttOtaFail();
 			return RESET;
 		}
-		OTA_Info.recv_flag = 0;
-		CRC32_Init(&chunkCtx);
-		CRC32_Update(&chunkCtx, OTA_Info.recv_buf, OTA_Info.request_bytes);
-		printf("[OTA] chunk %u/%u ok, len=%u crc=%08lx\r\n", (unsigned int)(i + 1), (unsigned int)size,
-			(unsigned int)OTA_Info.request_bytes, (unsigned long)CRC32_Final(&chunkCtx, 0));
+		/* 逐包 CRC 仅首包打摘要；进度百分比在 Update_Progress */
 		if (i == 0) {
-			printf("[OTA] chunk 1 head: %02x %02x %02x %02x %02x %02x %02x %02x\r\n",
-				OTA_Info.recv_buf[0], OTA_Info.recv_buf[1], OTA_Info.recv_buf[2], OTA_Info.recv_buf[3],
-				OTA_Info.recv_buf[4], OTA_Info.recv_buf[5], OTA_Info.recv_buf[6], OTA_Info.recv_buf[7]);
+			CRC32_Context chunkCtx;
+			CRC32_Init(&chunkCtx);
+			CRC32_Update(&chunkCtx, OTA_Info.chunk_buf, OTA_Info.request_bytes);
+			printf("[OTA] chunk 1/%u ok, len=%u crc=%08lx head: %02x %02x %02x %02x\r\n",
+				(unsigned int)size,
+				(unsigned int)OTA_Info.request_bytes,
+				(unsigned long)CRC32_Final(&chunkCtx, 0),
+				OTA_Info.chunk_buf[0], OTA_Info.chunk_buf[1],
+				OTA_Info.chunk_buf[2], OTA_Info.chunk_buf[3]);
 		}
 
-		Update_Progress(OTA_Info.request_bytes); // 进度按实际字节数累加
+		Update_Progress(OTA_Info.request_bytes);
 
-		// 先把本包累加到 CRC，再写入 W25Q（request_bytes 就是本包实际字节数，最后一包可能不足 256）
-		CRC32_Update(&crc_ctx, OTA_Info.recv_buf, OTA_Info.request_bytes); // 增量更新CRC
-		if (W25Q_Write(OTA_DATA_ADDR + i * 256, OTA_Info.recv_buf, OTA_Info.request_bytes) != W25Q_OK) {
+		CRC32_Update(&crc_ctx, OTA_Info.chunk_buf, OTA_Info.request_bytes);
+		if (W25Q_Write(OTA_DATA_ADDR + i * 256, OTA_Info.chunk_buf, OTA_Info.request_bytes) != W25Q_OK) {
 			printf("[W25Q] write FAIL chunk=%d addr=0x%06x\r\n", (int)i, (unsigned int)(OTA_DATA_ADDR + i * 256));
+			OTA_Info.recv_flag = 0;
 			mqttOtaFail();
 			return RESET;
 		}
+		OTA_Info.recv_flag = 0;
 	}
 
 	printf("[OTA] download done, %u chunks, rx since start: FE=%u NE=%u ORE=%u drop=%u\r\n",
@@ -421,18 +447,18 @@ uint8_t MQTT_OTA_GetFW(void) {
 	}
 	printf("[OTA] CRC OK: %08lx, verify W25Q readback\r\n", (unsigned long)crc32);
 
-	// 回读 W25Q 重新计算 CRC，确认写进去的数据和收到的一致
+	// 回读 W25Q 重新计算 CRC，确认写进去的数据和收到的一致（用 chunk_buf，不碰 mqttJsonBuf）
 	CRC32_Init(&crc_ctx);
 	for (addr = 0; addr < OTA_Info.fw_size; addr += 256) {
 		n = OTA_Info.fw_size - addr;
 		if (n > 256) {
 			n = 256;
 		}
-		if (W25Q_Read(OTA_DATA_ADDR + addr, OTA_Info.recv_buf, n) != W25Q_OK) {
+		if (W25Q_Read(OTA_DATA_ADDR + addr, OTA_Info.chunk_buf, n) != W25Q_OK) {
 			mqttOtaFail();
 			return RESET;
 		}
-		CRC32_Update(&crc_ctx, OTA_Info.recv_buf, n);
+		CRC32_Update(&crc_ctx, OTA_Info.chunk_buf, n);
 	}
 	if (CRC32_Final(&crc_ctx, 0) != crcStd) {
 		printf("[OTA] W25Q readback CRC FAIL (data in flash differs)\r\n");
@@ -451,7 +477,8 @@ uint8_t MQTT_OTA_GetFW(void) {
 		return RESET;
 	}
 
-	mqttSendData((uint8_t *)PUB1, 2, 0); // 成功
+	printf("[OTA] SUCCESS, reset to Bootloader\r\n");
+	mqttSendData((uint8_t *)PUB1, MQTT_MSG_OTA_OK, 0);
 	HAL_NVIC_SystemReset(); // 重启系统，由 Bootloader 把 W25Q 中的固件搬运到应用程序区
 	return SET;
 }
@@ -481,11 +508,12 @@ uint8_t mqttConnect(void) {
 	if (ret == WIFI4G_OK) {
 		gWifi4G.connected = 1;
 		gWifi4G.errCount = 0;   // 新连接，清零错误计数
-		OLED_ShowStr(0, 3, (unsigned char *)"MQTTServer... OK", 2);
+		printf("[MQTT] connect OK\r\n");
+		OLED_ShowStr(0, 3, (unsigned char *)"MQTTServer... OK", OLED_FONT_8X16);
 		return SET;
 	} else {
 		printf("[MQTT] connect FAIL, AT+REST result=%d (0=timeout, 2=ERROR)\r\n", (int)ret);
-		OLED_ShowStr(0, 3, (unsigned char *)"MQTTServer... --", 2);
+		OLED_ShowStr(0, 3, (unsigned char *)"MQTTServer... --", OLED_FONT_8X16);
 		return RESET;
 	}
 }

@@ -30,6 +30,7 @@
 #include "modbus.h"
 #include "oled.h"
 #include "i2c.h"
+#include "iwdg.h"
 #include <stdio.h>
 /* USER CODE END Includes */
 
@@ -41,10 +42,12 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 // 任务栈大小的单位是「字」（4 字节）
-#define COMM_TASK_STACK      512                      // 通信任务：AT 命令、MQTT、cJSON、OTA，局部缓冲区较大
+#define COMM_TASK_STACK      512                      // 通信任务：AT 命令、MQTT、cJSON，局部缓冲区较大
 #define COMM_TASK_PRIO       (tskIDLE_PRIORITY + 1)
 #define SENSOR_TASK_STACK    256                      // 传感器任务：I2C、ADC、浮点换算
-#define SENSOR_TASK_PRIO     (tskIDLE_PRIORITY + 2)   // 高于通信任务：通信任务擦写 W25Q 时会忙等，不能让传感器停更
+#define SENSOR_TASK_PRIO     (tskIDLE_PRIORITY + 2)   // 最高：擦写忙等时传感器仍要更新
+#define OTA_TASK_STACK       512                      // OTA 任务：下载状态机、CRC、W25Q
+#define OTA_TASK_PRIO        (tskIDLE_PRIORITY + 0)   // 低于 Comm：擦写等待已让出，Comm 更高作双保险
 
 #define COMM_POLL_MS         10       // 没有新数据时，最多等这么久也要解析一次
 #define UPLOAD_PERIOD_MS     5000     // 传感器数据上报周期（ms）
@@ -62,13 +65,10 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
-// 任务都用静态内存创建：占用的 RAM 在编译时就能从 ZI-data 看出来，不依赖 FreeRTOS 堆大小
-static StaticTask_t commTaskTCB;
-static StackType_t commTaskStack[COMM_TASK_STACK];
+// 业务任务从 FreeRTOS 堆动态创建（见 configTOTAL_HEAP_SIZE）
 static TaskHandle_t commTaskHandle = NULL;
-
-static StaticTask_t sensorTaskTCB;
-static StackType_t sensorTaskStack[SENSOR_TASK_STACK];
+static TaskHandle_t sensorTaskHandle = NULL;
+static TaskHandle_t otaTaskHandle = NULL;
 /* USER CODE END Variables */
 osThreadId defaultTaskHandle;
 
@@ -76,6 +76,7 @@ osThreadId defaultTaskHandle;
 /* USER CODE BEGIN FunctionPrototypes */
 static void CommTask(void *argument);
 static void SensorTask(void *argument);
+static void OtaTask(void *argument);
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void const * argument);
@@ -130,11 +131,23 @@ void MX_FREERTOS_Init(void) {
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
-	commTaskHandle = xTaskCreateStatic(CommTask, "comm", COMM_TASK_STACK, NULL,
-		COMM_TASK_PRIO, commTaskStack, &commTaskTCB);
+	if (xTaskCreate(CommTask, "comm", COMM_TASK_STACK, NULL,
+			COMM_TASK_PRIO, &commTaskHandle) != pdPASS) {
+		printf("[ERR] create CommTask fail\r\n");
+		Error_Handler();
+	}
 	wifiBindTask(commTaskHandle);   // 串口中断收到数据后通知这个任务
-	xTaskCreateStatic(SensorTask, "sensor", SENSOR_TASK_STACK, NULL,
-		SENSOR_TASK_PRIO, sensorTaskStack, &sensorTaskTCB);
+	if (xTaskCreate(SensorTask, "sensor", SENSOR_TASK_STACK, NULL,
+			SENSOR_TASK_PRIO, &sensorTaskHandle) != pdPASS) {
+		printf("[ERR] create SensorTask fail\r\n");
+		Error_Handler();
+	}
+	if (xTaskCreate(OtaTask, "ota", OTA_TASK_STACK, NULL,
+			OTA_TASK_PRIO, &otaTaskHandle) != pdPASS) {
+		printf("[ERR] create OtaTask fail\r\n");
+		Error_Handler();
+	}
+	printf("> tasks created\r\n");
   /* USER CODE END RTOS_THREADS */
 
 }
@@ -149,78 +162,100 @@ void MX_FREERTOS_Init(void) {
 void StartDefaultTask(void const * argument)
 {
   /* USER CODE BEGIN StartDefaultTask */
-	// 业务都在 CommTask / SensorTask 里，CubeMX 生成的这个任务直接删除自己，内存由空闲任务回收
+	// 业务都在 CommTask / SensorTask / OtaTask 里，CubeMX 生成的这个任务直接删除自己
 	vTaskDelete(NULL);
   /* USER CODE END StartDefaultTask */
 }
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
-// 通信任务：独占 USART3（4G 模组）、W25Q、cJSON 和 printf，这些资源不需要再加锁
+// 通信任务：独占串口接收解析（wifiPoll），负责连接、遥测、RPC；OTA 下载交给 OtaTask
 static void CommTask(void *argument) {
 	TickType_t now = 0;
 	TickType_t uploadTick = 0;
 	TickType_t retryTick = 0;
 	TickType_t otaWaitTick = 0;
-	uint8_t otaWaiting = 0;   // OTA 已请求，正在等待 OTA_START_DELAY_MS 后开始
+	uint8_t otaWaiting = 0;   // OTA 已请求，正在等待 OTA_START_DELAY_MS 后通知 OtaTask
 
 	(void)argument;
-	printf("> comm task start\r\n");   // 调试用：确认调度器已经启动
-	mqttConnect();            // 连接结果保存在 gWifi4G.connected 中，最长阻塞 180 秒（只阻塞本任务）
-	printf("> MQTT %s\r\n", gWifi4G.connected ? "connected" : "not connected");   // 调试用
+	printf("> comm task start\r\n");
+	mqttConnect();            // 最长阻塞 180 秒（只阻塞本任务）
+	printf("> MQTT %s\r\n", gWifi4G.connected ? "connected" : "not connected");
 	retryTick = xTaskGetTickCount();
 	uploadTick = retryTick;
 
 	for (;;) {
-		wifiWaitRx(COMM_POLL_MS);   // 等串口数据（中断通知），最多等 COMM_POLL_MS
+		wifiWaitRx(COMM_POLL_MS);
 		wifiPoll();
 		now = xTaskGetTickCount();
 
-		// 每隔 UPLOAD_PERIOD_MS 上报一次（未连接时不上报）
 		if ((now - uploadTick) >= pdMS_TO_TICKS(UPLOAD_PERIOD_MS)) {
 			uploadTick = now;
-			if (gWifi4G.connected) {
-				mqttSendData((uint8_t *)PUB1, 1, 0);
+			if (gWifi4G.connected && !gOtaBusy) {
+				mqttSendData((uint8_t *)PUB1, MQTT_MSG_TELEMETRY, 0);
 			}
 		}
-		// 掉线判定：已连接时连续收到多次 ERROR，认为 MQTT 已断开
 		if (gWifi4G.connected && gWifi4G.errCount >= MQTT_ERR_LIMIT) {
 			gWifi4G.connected = 0;
 			gWifi4G.errCount = 0;
 			retryTick = now;
-			OLED_ShowStr(0, 3, (unsigned char *)"MQTTServer... --", 2);
+			printf("> MQTT offline (ERROR x%d)\r\n", MQTT_ERR_LIMIT);
+			OLED_ShowStr(0, 3, (unsigned char *)"MQTTServer... --", OLED_FONT_8X16);
 		}
-		// 断开后，每隔 MQTT_RECONNECT_MS 重连一次
-		if (!gWifi4G.connected && (now - retryTick) >= pdMS_TO_TICKS(MQTT_RECONNECT_MS)) {
+		if (!gOtaBusy && !gWifi4G.connected &&
+			(now - retryTick) >= pdMS_TO_TICKS(MQTT_RECONNECT_MS)) {
 			retryTick = now;
+			printf("> MQTT reconnect...\r\n");
 			mqttConnect();
+			printf("> MQTT %s\r\n", gWifi4G.connected ? "connected" : "not connected");
 		}
-		// 收到 OTA 信息后先等 OTA_START_DELAY_MS，期间照常收数据，再开始下载
-		if (gOtaFlag && !otaWaiting) {
+		if (gOtaFlag && !otaWaiting && !gOtaBusy) {
 			gOtaFlag = 0;
 			otaWaiting = 1;
 			otaWaitTick = now;
+			printf("> OTA request, start in %d ms\r\n", OTA_START_DELAY_MS);
 		}
 		if (otaWaiting && (now - otaWaitTick) >= pdMS_TO_TICKS(OTA_START_DELAY_MS)) {
 			otaWaiting = 0;
-			MQTT_OTA_GetFW();   // 成功会重启；失败按重试次数重新置位 gOtaFlag
+			printf("> OTA notify OtaTask\r\n");
+			if (otaTaskHandle != NULL) {
+				xTaskNotifyGive(otaTaskHandle);
+			}
 		}
 	}
 }
 
 // 传感器任务：读 AHT20、INA226、ADC，按 REG_HOLD_BUF[0] 刷新 LED/蜂鸣器/继电器
+// 同时负责 IWDG：本任务优先级最高，约每 20 ms 喂狗（超时约 4 s）
 static void SensorTask(void *argument) {
 	TickType_t refreshTick = 0;
 
 	(void)argument;
+	printf("> sensor task start\r\n");
+	/* 先让出一拍：本任务优先级最高，若立刻开 IWDG/跑业务，Comm 的启动日志会被拖住 */
+	vTaskDelay(pdMS_TO_TICKS(1));
+	IWDG_AppStart();
+	printf("> IWDG start (prescaler/256 reload=624, ~4s)\r\n");
 	refreshTick = xTaskGetTickCount();
 	for (;;) {
+		IWDG_AppRefresh();
 		if ((xTaskGetTickCount() - refreshTick) >= pdMS_TO_TICKS(SENSOR_PERIOD_MS)) {
 			refreshTick = xTaskGetTickCount();
 			Modbus_Refresh();
 		}
 		Modbus_Parse();
 		vTaskDelay(pdMS_TO_TICKS(SENSOR_POLL_MS));
+	}
+}
+
+// OTA 任务：下载状态机、写 W25Q、刷进度；收包仍由 CommTask 解析后写入 chunk_buf
+static void OtaTask(void *argument) {
+	(void)argument;
+	printf("> ota task start\r\n");
+	for (;;) {
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		printf("> OtaTask run download\r\n");
+		MQTT_OTA_GetFW();   // 成功会重启；失败按重试次数重新置位 gOtaFlag
 	}
 }
 /* USER CODE END Application */
